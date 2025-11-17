@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpySignal WebApp (E2EE)</title>
+
+    <style>
+        body {
+            margin: 0;
+            background: #0b0f17;
+            color: #fff;
+            font-family: Arial, sans-serif;
+        }
+
+        .container {
+            padding: 20px;
+        }
+
+        input, button {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border-radius: 8px;
+            border: none;
+            font-size: 16px;
+        }
+
+        input {
+            background: #1a1f2b;
+            color: white;
+        }
+
+        button {
+            background: #3d7bfd;
+            color: white;
+            cursor: pointer;
+        }
+
+        .user-item {
+            padding: 10px;
+            margin-top: 5px;
+            background: #1d2433;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .chat {
+            border-top: 1px solid #333;
+            margin-top: 20px;
+            padding-top: 10px;
+            height: 50vh;
+            overflow-y: auto;
+        }
+
+        .msg {
+            background: #243043;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 8px;
+            width: fit-content;
+            max-width: 80%;
+            opacity: 0;
+            transform: translateY(5px);
+            animation: fadeInUp 0.2s forwards;
+        }
+
+        .me {
+            background: #3d7bfd;
+            margin-left: auto;
+        }
+
+        @keyframes fadeInUp {
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .typing {
+            font-size: 13px;
+            color: #999;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+
+    <h2>SpySignal WebApp 🔐 E2EE</h2>
+
+    <!-- Login / Register -->
+    <div id="login-block">
+        <h3>Вхід / Реєстрація</h3>
+        <input id="username" placeholder="Ваш нікнейм">
+        <button onclick="register()">Увійти</button>
+    </div>
+
+    <!-- Search -->
+    <div id="search-block" style="display:none;">
+        <h3>Пошук користувача</h3>
+        <input id="search" placeholder="Введіть ID або нікнейм" oninput="searchUser()">
+        <div id="result"></div>
+    </div>
+
+    <!-- Chat -->
+    <div id="chat-block" style="display:none%;">
+        <h3 id="chat-title"></h3>
+        <div class="typing" id="typing-indicator" style="display:none;">Співрозмовник друкує...</div>
+        <div class="chat" id="chat"></div>
+
+        <input id="msg" placeholder="Повідомлення..." oninput="onTyping()">
+        <button onclick="sendMessage()">Відправити</button>
+    </div>
+
+</div>
+
+<script>
+    // 🔥 СЮДИ ВСТАВИ домен бекенду (Render)
+    const API_BASE = "https://spysignal-backend.onrender.com";
+
+    let token = null;
+    let myID = null;
+    let peerID = null;
+
+    let lastMessagesCount = 0;
+    let pollingInterval = null;
+    let typingTimeout = null;
+
+    // E2EE stuff
+    let myPrivateKey = null;
+    let myPublicJwk = null;
+    const LOCAL_KEY_STORAGE = "spysignal_e2ee_keypair_v1";
+
+    // Text encoder/decoder
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+
+    function bufToBase64(buf) {
+        let bin = "";
+        const bytes = new Uint8Array(buf);
+        for (let b of bytes) {
+            bin += String.fromCharCode(b);
+        }
+        return btoa(bin);
+    }
+
+    function base64ToBuf(b64) {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) {
+            bytes[i] = bin.charCodeAt(i);
+        }
+        return bytes.buffer;
+    }
+
+    async function ensureKeyPair() {
+        if (myPrivateKey && myPublicJwk) return;
+
+        const raw = localStorage.getItem(LOCAL_KEY_STORAGE);
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                myPublicJwk = parsed.publicJwk;
+                const privJwk = parsed.privateJwk;
+                myPrivateKey = await crypto.subtle.importKey(
+                    "jwk",
+                    privJwk,
+                    { name: "ECDH", namedCurve: "P-256" },
+                    false,
+                    ["deriveKey", "deriveBits"]
+                );
+                return;
+            } catch (e) {
+                console.warn("Не вдалося розпарсити локальний ключ, генеруємо новий", e);
+            }
+        }
+
+        const keyPair = await crypto.subtle.generateKey(
+            { name: "ECDH", namedCurve: "P-256" },
+            true,
+            ["deriveKey", "deriveBits"]
+        );
+
+        const pubJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+        const privJwk = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
+
+        myPrivateKey = keyPair.privateKey;
+        myPublicJwk = pubJwk;
+
+        localStorage.setItem(
+            LOCAL_KEY_STORAGE,
+            JSON.stringify({ publicJwk: pubJwk, privateJwk: privJwk })
+        );
+    }
+
+    async function getAesKeyForPeer(peerPubJwk) {
+        if (!myPrivateKey) {
+            await ensureKeyPair();
+        }
+
+        const peerPubKey = await crypto.subtle.importKey(
+            "jwk",
+            peerPubJwk,
+            { name: "ECDH", namedCurve: "P-256" },
+            false,
+            []
+        );
+
+        const aesKey = await crypto.subtle.deriveKey(
+            { name: "ECDH", public: peerPubKey },
+            myPrivateKey,
+            { name: "AES-GCM", length: 256 },
+            false,
+            ["encrypt", "decrypt"]
+        );
+
+        return aesKey;
+    }
+
+    async function encryptForPeer(plaintext, peerPubJwk) {
+        const key = await getAesKeyForPeer(peerPubJwk);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+
+        const ciphertextBuf = await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv },
+            key,
+            encoder.encode(plaintext)
+        );
+
+        return {
+            iv: bufToBase64(iv.buffer),
+            ciphertext: bufToBase64(ciphertextBuf),
+        };
+    }
+
+    async function decryptFromPeer(ciphertextB64, ivB64, peerPubJwk) {
+        const key = await getAesKeyForPeer(peerPubJwk);
+
+        const ivBuf = base64ToBuf(ivB64);
+        const ctBuf = base64ToBuf(ciphertextB64);
+
+        const plainBuf = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: new Uint8Array(ivBuf) },
+            key,
+            ctBuf
+        );
+
+        return decoder.decode(plainBuf);
+    }
+
+    async function register() {
+        let username = document.getElementById("username").value.trim();
+        if (!username) return alert("Введіть нікнейм!");
+
+        let res = await fetch(`${API_BASE}/api/register`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ username })
+        });
+
+        let data = await res.json();
+
+        if (!data.token || !data.id) {
+            console.error("Помилка реєстрації:", data);
+            return alert("Помилка реєстрації");
+        }
+
+        token = data.token;
+        myID = data.id;
+
+        await ensureKeyPair();
+
+        await fetch(`${API_BASE}/api/pubkey`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: "Bearer " + token
+            },
+            body: JSON.stringify({
+                pubkey: JSON.stringify(myPublicJwk)
+            })
+        });
+
+        document.getElementById("login-block").style.display = "none";
+        document.getElementById("search-block").style.display = "block";
+
+        alert("Успішно! Ваш ID: " + myID);
+    }
+
+    async function searchUser() {
+        let q = document.getElementById("search").value.trim();
+        if (!q) { document.getElementById("result").innerHTML = ""; return; }
+
+        try {
+            let res = await fetch(`${API_BASE}/api/users/search?query=${encodeURIComponent(q)}`);
+            let data = await res.json();
+            let users = data.results || [];
+
+            let html = "";
+
+            users.forEach(u => {
+                html += `<div class="user-item" onclick="openChat(${u.id}, '${u.username}')">
+                            ${u.username} <small>(ID: ${u.id})</small>
+                        </div>`;
+            });
+
+            document.getElementById("result").innerHTML = html;
+        } catch (e) {
+            console.error("Помилка пошуку:", e);
+        }
+    }
+
+    const peerPubKeyCache = {};
+
+    async function fetchPeerPubKey(peerId) {
+        if (peerPubKeyCache[peerId]) return peerPubKeyCache[peerId];
+
+        const res = await fetch(`${API_BASE}/api/pubkey/${peerId}`);
+        if (!res.ok) {
+            throw new Error("У користувача немає E2EE ключа");
+        }
+        const data = await res.json();
+        const jwk = JSON.parse(data.pubkey);
+        peerPubKeyCache[peerId] = jwk;
+        return jwk;
+    }
+
+    async function openChat(id, username) {
+        peerID = id;
+
+        document.getElementById("chat-title").innerText = "Чат з " + username;
+        document.getElementById("search-block").style.display = "none";
+        document.getElementById("chat-block").style.display = "block";
+
+        lastMessagesCount = 0;
+
+        await loadMessages();
+
+        if (pollingInterval) clearInterval(pollingInterval);
+        pollingInterval = setInterval(loadMessages, 2000);
+    }
+
+    async function loadMessages() {
+        if (!peerID || !token) return;
+
+        try {
+            let res = await fetch(`${API_BASE}/api/messages?peer_id=${peerID}`, {
+                headers: { Authorization: "Bearer " + token }
+            });
+
+            let data = await res.json();
+
+            let msgs = data.messages || [];
+            let chatEl = document.getElementById("chat");
+
+            const peerPubJwk = await fetchPeerPubKey(peerID);
+
+            let isNew = msgs.length > lastMessagesCount;
+
+            let html = "";
+            for (let m of msgs) {
+                let cls = m.from_id === myID ? "msg me" : "msg";
+
+                let text = "[не вдалося розшифрувати]";
+                try {
+                    text = await decryptFromPeer(m.ciphertext, m.iv, peerPubJwk);
+                } catch (e) {
+                    console.warn("Помилка дешифрування", e);
+                }
+
+                html += `<div class="\${cls}">\${text}</div>`;
+            }
+
+            chatEl.innerHTML = html;
+            chatEl.scrollTop = chatEl.scrollHeight;
+
+            if (isNew) {
+                lastMessagesCount = msgs.length;
+                if (navigator.vibrate) {
+                    navigator.vibrate(50);
+                }
+            } else {
+                lastMessagesCount = msgs.length;
+            }
+
+        } catch (e) {
+            console.error("Помилка завантаження повідомлень:", e);
+        }
+    }
+
+    function onTyping() {
+        if (typingTimeout) clearTimeout(typingTimeout);
+
+        const typingEl = document.getElementById("typing-indicator");
+        typingEl.innerText = "Ви друкуєте...";
+        typingEl.style.display = "block";
+
+        typingTimeout = setTimeout(() => {
+            typingEl.style.display = "none";
+        }, 1200);
+    }
+
+    async function sendMessage() {
+        let input = document.getElementById("msg");
+        let msg = input.value.trim();
+        if (!msg) return;
+
+        try {
+            const peerPubJwk = await fetchPeerPubKey(peerID);
+
+            const { iv, ciphertext } = await encryptForPeer(msg, peerPubJwk);
+
+            await fetch(`${API_BASE}/api/messages`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: "Bearer " + token
+                },
+                body: JSON.stringify({
+                    to: peerID,
+                    iv: iv,
+                    ciphertext: ciphertext
+                })
+            });
+
+            input.value = "";
+            await loadMessages();
+        } catch (e) {
+            console.error("Помилка надсилання:", e);
+            alert("Не вдалося надіслати (E2EE). Перевірьте ключі.");
+        }
+    }
+</script>
+
+</body>
+</html>
